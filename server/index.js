@@ -89,6 +89,165 @@ function getFileSize(filepath) {
   }
 }
 
+// Start FFmpeg for a job
+function startFfmpeg(job) {
+  const { url, filename, outTime } = job;
+  const outputPath = path.join(DOWNLOAD_DIR, filename);
+
+  jobLog(`[${job.id}] Starting: ${url}`);
+  jobLog(`[${job.id}] Output: ${outputPath}`);
+  if (outTime) jobLog(`[${job.id}] Resuming from: ${formatTime(outTime)}s`);
+
+  // Delete existing file if present (FFmpeg won't overwrite)
+  if (fs.existsSync(outputPath)) {
+    fs.unlinkSync(outputPath);
+    jobLog(`[${job.id}] Deleted existing file`);
+  }
+
+  const args = [
+    '-y',
+    '-i', url,
+    '-c', 'copy',
+    '-bsf:a', 'aac_adtstoasc',
+    '-movflags', '+faststart',
+    '-progress', 'pipe:1',
+    outputPath,
+  ];
+
+  // If resuming from a position, add -ss before -i
+  if (outTime && outTime > 0) {
+    args.splice(2, 0, '-ss', String(outTime));
+  }
+
+  const ffmpeg = spawn('ffmpeg', args);
+  job.process = ffmpeg;
+
+  let durationEstimate = job.durationEstimate || null;
+  let lastLoggedProgress = -1;
+  let lastFileSize = job.totalBytes || 0;
+  let totalBytes = job.totalBytes || 0;
+  let firstProgress = true;
+
+  // Watch output file size to estimate progress
+  const sizeWatch = setInterval(() => {
+    try {
+      if (fs.existsSync(outputPath)) {
+        const stats = fs.statSync(outputPath);
+        const currentSize = stats.size;
+        if (currentSize > lastFileSize) {
+          lastFileSize = currentSize;
+          job.totalBytes = currentSize;
+          if (durationEstimate && lastFileSize > 0) {
+            const progress = Math.min(98, Math.round((lastFileSize / totalBytes) * 100));
+            if (progress !== lastLoggedProgress) {
+              jobLog(`[${job.id}] Progress: ${lastFileSize} / ${totalBytes} bytes = ${progress}%`);
+              lastLoggedProgress = progress;
+              job.progress = progress;
+            }
+          }
+        }
+      }
+    } catch {}
+  }, 1000);
+
+  ffmpeg.stderr.on('data', (data) => {
+    const line = data.toString();
+    if (!durationEstimate) {
+      const durMatch = line.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
+      if (durMatch) {
+        const [, h, m, s, ms] = durMatch.map(Number);
+        durationEstimate = h * 3600 + m * 60 + s + ms / 100;
+        job.durationEstimate = durationEstimate;
+        jobLog(`[${job.id}] Duration from header: ${durationEstimate.toFixed(1)}s`);
+      }
+    }
+  });
+
+  ffmpeg.stdout.on('data', (data) => {
+    const line = data.toString().trim();
+    if (!line) return;
+
+    const outTimeMatch = line.match(/out_time_ms=(\d+)/);
+    if (outTimeMatch && durationEstimate) {
+      const currentTime = parseInt(outTimeMatch[1]) / 1000000;
+      if (currentTime > 0) {
+        job.outTime = currentTime;
+        const progress = Math.min(98, Math.round((currentTime / durationEstimate) * 100));
+        if (progress !== lastLoggedProgress || firstProgress) {
+          firstProgress = false;
+          lastLoggedProgress = progress;
+          job.progress = progress;
+          job.message = `${formatTime(currentTime)} / ${formatTime(durationEstimate)}`;
+        }
+      }
+    }
+
+    const sizeMatch = line.match(/total_size=(\d+)/);
+    if (sizeMatch) {
+      totalBytes = parseInt(sizeMatch[1]);
+      job.totalBytes = totalBytes;
+    }
+  });
+
+  ffmpeg.on('close', (code) => {
+    clearInterval(sizeWatch);
+    const job = jobs.get(job.id);
+    if (!job) { currentJobId = null; return; }
+
+    if (code === 0) {
+      job.state = 'done';
+      job.progress = 100;
+      job.message = 'Done';
+      job.downloadUrl = `/downloads/${filename}`;
+      job.fileSize = getFileSize(outputPath);
+      jobLog(`[${job.id}] Done: ${filename} (${job.fileSize})`);
+      setTimeout(() => {
+        jobs.delete(job.id);
+        jobLog(`[${job.id}] Removed from queue`);
+      }, 100);
+    } else if (job.retries < 2) {
+      job.retries++;
+      job.state = 'queued';
+      job.progress = 0;
+      job.message = `Retry ${job.retries}/3`;
+      jobLog(`[${job.id}] Retry ${job.retries}/3 (exit code ${code})`);
+      setTimeout(() => processNextJob(), 2000);
+    } else {
+      job.state = 'error';
+      job.message = 'Failed after 3 attempts';
+      jobLog(`[${job.id}] Error: exited with code ${code}`);
+    }
+
+    currentJobId = null;
+    delete job.process;
+    processNextJob();
+  });
+
+  ffmpeg.on('error', (err) => {
+    clearInterval(sizeWatch);
+    const job = jobs.get(job.id);
+    if (!job) { currentJobId = null; return; }
+
+    jobLog(`[${job.id}] FFmpeg error: ${err.message}`);
+
+    if (job.retries < 2) {
+      job.retries++;
+      job.state = 'queued';
+      job.progress = 0;
+      job.message = `Retry ${job.retries}/3`;
+      jobLog(`[${job.id}] Network error, retry ${job.retries}/3`);
+      setTimeout(() => processNextJob(), 2000);
+    } else {
+      job.state = 'error';
+      job.message = 'Failed: network error';
+    }
+
+    currentJobId = null;
+    delete job.process;
+    processNextJob();
+  });
+}
+
 // Process next queued job
 function processNextJob() {
   if (currentJobId) return;
@@ -107,152 +266,7 @@ function processNextJob() {
   job.state = 'running';
   job.startedAt = Date.now();
 
-  const { url, filename } = job;
-  const outputPath = path.join(DOWNLOAD_DIR, filename);
-
-  jobLog(`[${currentJobId}] Starting: ${url}`);
-  jobLog(`[${currentJobId}] Output: ${outputPath}`);
-
-  // Delete existing file if present (FFmpeg won't overwrite)
-  if (fs.existsSync(outputPath)) {
-    fs.unlinkSync(outputPath);
-    jobLog(`[${currentJobId}] Deleted existing file`);
-  }
-
-  const ffmpeg = spawn('ffmpeg', [
-    '-y', // overwrite output file without asking
-    '-i', url,
-    '-c', 'copy',
-    '-bsf:a', 'aac_adtstoasc',
-    '-movflags', '+faststart',
-    '-progress', 'pipe:1',
-    outputPath,
-  ]);
-
-  job.process = ffmpeg;
-
-  let durationEstimate = null;
-  let lastLoggedProgress = -1;
-  let lastFileSize = 0;
-  let totalBytes = 0;
-
-  // Watch output file size to estimate progress
-  const sizeWatch = setInterval(() => {
-    try {
-      if (fs.existsSync(outputPath)) {
-        const stats = fs.statSync(outputPath);
-        const currentSize = stats.size;
-        if (currentSize > lastFileSize) {
-          lastFileSize = currentSize;
-          // Update progress based on file size (rough estimate)
-          if (durationEstimate && lastFileSize > 0) {
-            const progress = Math.min(98, Math.round((lastFileSize / totalBytes) * 100));
-            if (progress !== lastLoggedProgress) {
-              jobLog(`[${currentJobId}] Progress: ${lastFileSize} / ${totalBytes} bytes = ${progress}%`);
-              lastLoggedProgress = progress;
-              job.progress = progress;
-              job.message = `${progress}%`;
-            }
-          }
-        }
-      }
-    } catch {}
-  }, 1000);
-
-  ffmpeg.stderr.on('data', (data) => {
-    const line = data.toString();
-    // Duration header only appears with re-encoding; for stream copy use size-based estimation
-    if (!durationEstimate) {
-      const durMatch = line.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
-      if (durMatch) {
-        const [, h, m, s, ms] = durMatch.map(Number);
-        durationEstimate = h * 3600 + m * 60 + s + ms / 100;
-        job.estimatedTotal = durationEstimate;
-        jobLog(`[${currentJobId}] Duration from header: ${durationEstimate.toFixed(1)}s`);
-      }
-    }
-  });
-
-  ffmpeg.stdout.on('data', (data) => {
-    const line = data.toString().trim();
-    if (!line) return;
-    // Parse "out_time_ms=1234567" from -progress output
-    const outTimeMatch = line.match(/out_time_ms=(\d+)/);
-    if (outTimeMatch && durationEstimate) {
-      const currentTime = parseInt(outTimeMatch[1]) / 1000000;
-      if (currentTime > 0) {
-        const progress = Math.min(98, Math.round((currentTime / durationEstimate) * 100));
-        if (progress !== lastLoggedProgress) {
-          jobLog(`[${currentJobId}] Progress: ${formatTime(currentTime)} / ${formatTime(durationEstimate)} = ${progress}%`);
-          lastLoggedProgress = progress;
-          job.progress = progress;
-          job.message = `${formatTime(currentTime)} / ${formatTime(durationEstimate)}`;
-        }
-      }
-    }
-    // Parse total_size from -progress output
-    const sizeMatch = line.match(/total_size=(\d+)/);
-    if (sizeMatch) {
-      totalBytes = parseInt(sizeMatch[1]);
-    }
-  });
-
-  ffmpeg.on('close', (code) => {
-    clearInterval(sizeWatch);
-    const job = jobs.get(currentJobId);
-    if (!job) { currentJobId = null; return; }
-
-    if (code === 0) {
-      job.state = 'done';
-      job.progress = 100;
-      job.message = 'Done';
-      job.downloadUrl = `/downloads/${filename}`;
-      job.fileSize = getFileSize(outputPath);
-      jobLog(`[${currentJobId}] Done: ${filename} (${job.fileSize})`);
-      // Remove from jobs map immediately
-      setTimeout(() => {
-        jobs.delete(currentJobId);
-        jobLog(`[${currentJobId}] Removed from queue`);
-      }, 100);
-    } else if (job.retries < 2) {
-      job.retries++;
-      job.state = 'queued';
-      job.progress = 0;
-      job.message = `Retry ${job.retries}/3`;
-      jobLog(`[${currentJobId}] Retry ${job.retries}/3 (exit code ${code})`);
-      setTimeout(() => processNextJob(), 2000);
-    } else {
-      job.state = 'error';
-      job.message = 'Failed after 3 attempts';
-      jobLog(`[${currentJobId}] Error: exited with code ${code}`);
-    }
-
-    currentJobId = null;
-    delete job.process;
-    processNextJob();
-  });
-
-  ffmpeg.on('error', (err) => {
-    const job = jobs.get(currentJobId);
-    if (!job) { currentJobId = null; return; }
-
-    jobLog(`[${currentJobId}] FFmpeg error: ${err.message}`);
-
-    if (job.retries < 2) {
-      job.retries++;
-      job.state = 'queued';
-      job.progress = 0;
-      job.message = `Retry ${job.retries}/3`;
-      jobLog(`[${currentJobId}] Network error, retry ${job.retries}/3`);
-      setTimeout(() => processNextJob(), 2000);
-    } else {
-      job.state = 'error';
-      job.message = 'Failed: network error';
-    }
-
-    currentJobId = null;
-    processNextJob();
-  });
+  startFfmpeg(job);
 }
 
 // POST /api/download
@@ -283,6 +297,9 @@ app.post('/api/download', async (req, res) => {
     createdAt: Date.now(),
     downloadUrl: null,
     fileSize: null,
+    outTime: null,
+    totalBytes: null,
+    durationEstimate: null,
   };
 
   jobs.set(jobId, job);
@@ -290,6 +307,210 @@ app.post('/api/download', async (req, res) => {
 
   res.json({ jobId, filename: finalFilename });
   processNextJob();
+});
+
+// POST /api/pause/:jobId
+app.post('/api/pause/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.state !== 'running') {
+    return res.status(400).json({ error: 'Job is not running' });
+  }
+
+  // Save current progress
+  const savedOutTime = job.outTime || 0;
+  const savedTotalBytes = job.totalBytes || 0;
+  const savedDuration = job.durationEstimate || null;
+
+  job.outTime = savedOutTime;
+  job.totalBytes = savedTotalBytes;
+  job.durationEstimate = savedDuration;
+  job.state = 'paused';
+
+  // Kill FFmpeg
+  if (job.process) {
+    job.process.kill('SIGTERM');
+    delete job.process;
+  }
+
+  jobLog(`[${job.id}] Paused at ${formatTime(savedOutTime)}s (${savedTotalBytes} bytes)`);
+  res.json({ ok: true });
+});
+
+// POST /api/resume/:jobId
+app.post('/api/resume/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.state !== 'paused') {
+    return res.status(400).json({ error: 'Job is not paused' });
+  }
+
+  // Store job id as current before startFfmpeg sets it
+  const resumeJobId = job.id;
+
+  job.state = 'resuming';
+  jobLog(`[${job.id}] Resuming from ${formatTime(job.outTime || 0)}s`);
+
+  // Start FFmpeg with seek position
+  const outputPath = path.join(DOWNLOAD_DIR, job.filename);
+  const { url, filename, outTime, totalBytes, durationEstimate } = job;
+
+  jobLog(`[${job.id}] Starting: ${url}`);
+  jobLog(`[${job.id}] Output: ${outputPath}`);
+  if (outTime) jobLog(`[${job.id}] Resuming from: ${formatTime(outTime)}s`);
+
+  // Delete existing file if present
+  if (fs.existsSync(outputPath)) {
+    fs.unlinkSync(outputPath);
+    jobLog(`[${job.id}] Deleted existing file (will restart from 0 due to segment expiry)`);
+    // Resume with -ss from beginning since we deleted file
+    job.outTime = 0;
+    job.totalBytes = 0;
+  }
+
+  const args = [
+    '-y',
+    '-i', url,
+    '-c', 'copy',
+    '-bsf:a', 'aac_adtstoasc',
+    '-movflags', '+faststart',
+    '-progress', 'pipe:1',
+    outputPath,
+  ];
+
+  // Seek to last known position
+  if (outTime && outTime > 0) {
+    args.splice(2, 0, '-ss', String(outTime));
+  }
+
+  const ffmpeg = spawn('ffmpeg', args);
+  job.process = ffmpeg;
+
+  let duration = durationEstimate;
+  let lastLoggedProgress = -1;
+  let lastFileSize = totalBytes || 0;
+  let total = totalBytes || 0;
+  let firstProgress = true;
+
+  const sizeWatch = setInterval(() => {
+    try {
+      if (fs.existsSync(outputPath)) {
+        const stats = fs.statSync(outputPath);
+        const currentSize = stats.size;
+        if (currentSize > lastFileSize) {
+          lastFileSize = currentSize;
+          job.totalBytes = currentSize;
+          if (duration && lastFileSize > 0) {
+            const progress = Math.min(98, Math.round((lastFileSize / total) * 100));
+            if (progress !== lastLoggedProgress) {
+              jobLog(`[${job.id}] Progress: ${lastFileSize} / ${total} bytes = ${progress}%`);
+              lastLoggedProgress = progress;
+              job.progress = progress;
+            }
+          }
+        }
+      }
+    } catch {}
+  }, 1000);
+
+  ffmpeg.stderr.on('data', (data) => {
+    const line = data.toString();
+    if (!duration) {
+      const durMatch = line.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
+      if (durMatch) {
+        const [, h, m, s, ms] = durMatch.map(Number);
+        duration = h * 3600 + m * 60 + s + ms / 100;
+        job.durationEstimate = duration;
+        jobLog(`[${job.id}] Duration from header: ${duration.toFixed(1)}s`);
+      }
+    }
+  });
+
+  ffmpeg.stdout.on('data', (data) => {
+    const line = data.toString().trim();
+    if (!line) return;
+
+    const outTimeMatch = line.match(/out_time_ms=(\d+)/);
+    if (outTimeMatch && duration) {
+      const currentTime = parseInt(outTimeMatch[1]) / 1000000;
+      if (currentTime > 0) {
+        job.outTime = currentTime;
+        const progress = Math.min(98, Math.round((currentTime / duration) * 100));
+        if (progress !== lastLoggedProgress || firstProgress) {
+          firstProgress = false;
+          lastLoggedProgress = progress;
+          job.progress = progress;
+          job.message = `${formatTime(currentTime)} / ${formatTime(duration)}`;
+        }
+      }
+    }
+
+    const sizeMatch = line.match(/total_size=(\d+)/);
+    if (sizeMatch) {
+      total = parseInt(sizeMatch[1]);
+      job.totalBytes = total;
+    }
+  });
+
+  ffmpeg.on('close', (code) => {
+    clearInterval(sizeWatch);
+    const job = jobs.get(resumeJobId);
+    if (!job) { currentJobId = null; return; }
+
+    // If immediately failed (segment expired), report that
+    if (code !== 0) {
+      job.state = 'paused';
+      job.message = 'Segment expired — resume failed';
+      jobLog(`[${job.id}] Resume failed: segment expired (exit code ${code})`);
+      delete job.process;
+      currentJobId = null;
+      res.json({ ok: false, reason: 'segment_expired' });
+      return;
+    }
+
+    if (code === 0) {
+      job.state = 'done';
+      job.progress = 100;
+      job.message = 'Done';
+      job.downloadUrl = `/downloads/${filename}`;
+      job.fileSize = getFileSize(outputPath);
+      jobLog(`[${job.id}] Done: ${filename} (${job.fileSize})`);
+      setTimeout(() => {
+        jobs.delete(job.id);
+        jobLog(`[${job.id}] Removed from queue`);
+      }, 100);
+    } else if (job.retries < 2) {
+      job.retries++;
+      job.state = 'queued';
+      job.progress = 0;
+      job.message = `Retry ${job.retries}/3`;
+      jobLog(`[${job.id}] Retry ${job.retries}/3 (exit code ${code})`);
+      setTimeout(() => processNextJob(), 2000);
+    } else {
+      job.state = 'error';
+      job.message = 'Failed after 3 attempts';
+      jobLog(`[${job.id}] Error: exited with code ${code}`);
+    }
+
+    currentJobId = null;
+    delete job.process;
+    processNextJob();
+  });
+
+  ffmpeg.on('error', (err) => {
+    clearInterval(sizeWatch);
+    const job = jobs.get(resumeJobId);
+    if (!job) { currentJobId = null; return; }
+
+    job.state = 'paused';
+    job.message = 'Resume error — try again';
+    jobLog(`[${job.id}] Resume error: ${err.message}`);
+    delete job.process;
+    currentJobId = null;
+    res.json({ ok: false, reason: 'error', message: err.message });
+  });
+
+  res.json({ ok: true });
 });
 
 // GET /api/status/:jobId
@@ -302,7 +523,6 @@ app.get('/api/status/:jobId', (req, res) => {
 
 // GET /api/queue
 app.get('/api/queue', (req, res) => {
-  // Return all jobs including completed (for history)
   const allJobs = Array.from(jobs.values())
     .map(({ process, ...j }) => j);
   res.json({ jobs: allJobs });
@@ -313,8 +533,11 @@ app.delete('/api/job/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
 
-  if (job.state === 'running' && job.process) {
-    job.process.kill('SIGTERM');
+  if (job.state === 'running' || job.state === 'paused' || job.state === 'resuming') {
+    if (job.process) {
+      job.process.kill('SIGTERM');
+      delete job.process;
+    }
     job.state = 'cancelled';
     job.message = 'Cancelled';
     jobLog(`[${job.id}] Cancelled`);
@@ -329,7 +552,7 @@ app.delete('/api/job/:jobId', (req, res) => {
   }
 });
 
-// SPA fallback — serve index.html for non-API routes
+// SPA fallback
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api') || req.path.startsWith('/downloads')) return next();
   const indexPath = path.join(distPath, 'index.html');

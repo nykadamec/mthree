@@ -7,6 +7,7 @@ function App() {
   const [filename, setFilename] = useState('');
   const [queue, setQueue] = useState([]);
   const [copyFeedback, setCopyFeedback] = useState(false);
+  const [notifState, setNotifState] = useState('default'); // 'default' | 'granted' | 'denied' | 'disabled'
   const pollingRef = useRef(null);
 
   // Load queue from localStorage on mount
@@ -15,7 +16,6 @@ function App() {
       const saved = localStorage.getItem('mthree_queue');
       if (saved) {
         const parsed = JSON.parse(saved);
-        // Keep done/error as-is, convert running to queued
         setQueue(parsed.map(j => ({
           ...j,
           state: j.state === 'running' ? 'queued' : j.state,
@@ -24,6 +24,37 @@ function App() {
       }
     } catch {}
   }, []);
+
+  // Notification permission check
+  useEffect(() => {
+    if (!('Notification' in window)) {
+      setNotifState('disabled');
+      return;
+    }
+    const stored = localStorage.getItem('mthree_notifications');
+    if (stored === 'granted') {
+      setNotifState('granted');
+    } else if (stored === 'denied') {
+      setNotifState('denied');
+    } else {
+      setNotifState('default');
+    }
+  }, []);
+
+  // Send notification for a done job
+  const sendNotification = (job) => {
+    if (notifState !== 'granted') return;
+    try {
+      const n = new Notification('MThree', {
+        body: `${job.filename} dokončeno (${job.fileSize || '?'})`,
+        icon: '',
+      });
+      n.onclick = () => { window.focus(); n.close(); };
+    } catch {}
+  };
+
+  // Track previous job states to detect transitions to 'done'
+  const prevJobStatesRef = useRef({});
 
   // Polling — runs continuously to sync with server state
   useEffect(() => {
@@ -37,6 +68,16 @@ function App() {
         setQueue(prev => {
           // Server is source of truth for all job states
           const serverMap = new Map(serverJobs.map(j => [j.id, j]));
+
+          // Detect newly completed jobs
+          serverJobs.forEach(j => {
+            const prevState = prevJobStatesRef.current[j.id];
+            if (prevState !== 'done' && j.state === 'done') {
+              sendNotification(j);
+            }
+            prevJobStatesRef.current[j.id] = j.state;
+          });
+
           // Keep jobs that were just added locally but server hasn't picked up yet
           const localOnly = prev.filter(j => !serverMap.has(j.id) && !j.downloadUrl);
           return [...serverJobs, ...localOnly];
@@ -46,7 +87,7 @@ function App() {
 
     pollingRef.current = setInterval(doPoll, POLL_INTERVAL);
     return () => clearInterval(pollingRef.current);
-  }, []); // empty deps — polling runs independently
+  }, [notifState]); // notifState in deps so callback has latest
 
   // Persist queue to localStorage (only completed jobs for history)
   useEffect(() => {
@@ -62,10 +103,9 @@ function App() {
     if (!url.trim() || !url.includes('.m3u8')) return;
 
     const proposedFilename = filename.trim() || `download_${Date.now().toString(36)}.mp4`;
-    // Duplicate check — if same filename already done, warn user
     const alreadyDone = queue.find(j => j.filename === proposedFilename && j.state === 'done');
     if (alreadyDone) {
-      alert(`"${proposedFilename}" already downloaded. Delete it from History first if you want to download again.`);
+      alert(`"${proposedFilename}" already downloaded. Delete it from History first.`);
       return;
     }
 
@@ -105,6 +145,27 @@ function App() {
     }
   };
 
+  const handlePause = async (jobId) => {
+    try {
+      await fetch(`/api/pause/${jobId}`, { method: 'POST' });
+    } catch {}
+  };
+
+  const handleResume = async (jobId) => {
+    try {
+      const res = await fetch(`/api/resume/${jobId}`, { method: 'POST' });
+      const data = await res.json();
+      if (!data.ok && data.reason === 'segment_expired') {
+        const restart = window.confirm('Segment vypršel. Chceš začít znovu od nuly?');
+        if (restart) {
+          // Cancel and re-add
+          await fetch(`/api/job/${jobId}`, { method: 'DELETE' });
+        }
+        // else — job stays paused
+      }
+    } catch {}
+  };
+
   const handleCancel = async (jobId) => {
     try {
       await fetch(`/api/job/${jobId}`, { method: 'DELETE' });
@@ -124,16 +185,48 @@ function App() {
     } catch {}
   };
 
-  const runningJob = queue.find(j => j.state === 'running');
+  const handleNotifToggle = async () => {
+    if (notifState === 'default') {
+      const perm = await Notification.requestPermission();
+      if (perm === 'granted') {
+        setNotifState('granted');
+        localStorage.setItem('mthree_notifications', 'granted');
+      } else {
+        setNotifState('denied');
+        localStorage.setItem('mthree_notifications', 'denied');
+      }
+    } else if (notifState === 'granted') {
+      setNotifState('default');
+      localStorage.setItem('mthree_notifications', 'default');
+    } else if (notifState === 'denied') {
+      // Can't re-request, just show denied state
+    }
+  };
+
+  const runningJob = queue.find(j => j.state === 'running' || j.state === 'resuming');
+  const pausedJob = queue.find(j => j.state === 'paused');
   const queuedJobs = queue.filter(j => j.state === 'queued');
   const completedJobs = queue.filter(j => j.state === 'done').slice(-10).reverse();
   const errorJobs = queue.filter(j => j.state === 'error');
 
+  const notifIcon = notifState === 'granted' ? '🔔' : notifState === 'denied' ? '🔕' : '⚪';
+  const notifDisabled = notifState === 'disabled' || notifState === 'denied';
+
   return (
     <>
       <header className="header">
-        <h1>MThree</h1>
-        <p>M3U8 → MP4 Downloader</p>
+        <div className="header-title">
+          <h1>MThree</h1>
+          <p>M3U8 → MP4 Downloader</p>
+        </div>
+        <button
+          className={`notif-btn ${notifDisabled ? 'notif-btn--disabled' : ''}`}
+          onClick={handleNotifToggle}
+          disabled={notifDisabled}
+          title={notifDisabled ? 'Notifications not available' : notifState === 'granted' ? 'Notifications on' : notifState === 'denied' ? 'Notifications blocked' : 'Enable notifications'}
+        >
+          {notifIcon}
+        </button>
       </header>
 
       {/* INPUT SECTION */}
@@ -174,9 +267,14 @@ function App() {
                 <span className="progress-dot"></span>
                 <span>{runningJob.filename}</span>
               </div>
-              <button className="btn btn-danger" onClick={() => handleCancel(runningJob.id)}>
-                Cancel
-              </button>
+              <div className="progress-actions">
+                <button className="btn btn-warning" onClick={() => handlePause(runningJob.id)}>
+                  Pause
+                </button>
+                <button className="btn btn-danger" onClick={() => handleCancel(runningJob.id)}>
+                  Cancel
+                </button>
+              </div>
             </div>
             <div className="progress-bar-wrap">
               <div
@@ -194,7 +292,38 @@ function App() {
         </div>
       )}
 
-      {/* HISTORY — completed downloads */}
+      {/* PAUSED JOB */}
+      {pausedJob && (
+        <div className="card">
+          <div className="progress-section">
+            <div className="progress-header">
+              <div className="progress-status">
+                <span className="progress-dot paused"></span>
+                <span>{pausedJob.filename}</span>
+              </div>
+              <div className="progress-actions">
+                <button className="btn btn-success" onClick={() => handleResume(pausedJob.id)}>
+                  Resume
+                </button>
+                <button className="btn btn-danger" onClick={() => handleCancel(pausedJob.id)}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+            <div className="progress-bar-wrap">
+              <div
+                className="progress-bar paused"
+                style={{ width: `${pausedJob.progress || 0}%` }}
+              />
+            </div>
+            <div className="progress-time">
+              {pausedJob.progress || 0}% — Paused
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* HISTORY */}
       {completedJobs.length > 0 && (
         <div className="card">
           <div className="card-title">History ({completedJobs.length})</div>
