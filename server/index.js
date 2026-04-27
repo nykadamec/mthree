@@ -468,10 +468,14 @@ function startTranslate(jobId) {
   job.progress = 0;
 
   const inputPath = path.join(DOWNLOAD_DIR, job.sourceFile);
+  // Try .en.txt first (plain text), fall back to .en.vtt (subtitles)
+  const enTxt = inputPath.replace(/\.[^.]+$/, '') + '.en.txt';
+  const enVtt = inputPath.replace(/\.[^.]+$/, '') + '.en.vtt';
+  const sourcePath = fs.existsSync(enTxt) ? enTxt : (fs.existsSync(enVtt) ? enVtt : null);
   const txtFilename = job.sourceFile.replace(/\.[^.]+$/, '') + '.cz.txt';
   const outputPath = path.join(DOWNLOAD_DIR, txtFilename);
 
-  jobLog(`[${jobId}] Translating: ${job.sourceFile} -> ${txtFilename}`);
+  jobLog(`[${jobId}] Translating: ${job.sourceFile} -> ${txtFilename} (source: ${sourcePath || 'not found'})`);
 
   let translated = false;
   const progressTick = setInterval(() => {
@@ -483,10 +487,24 @@ function startTranslate(jobId) {
     }
   }, 500);
 
-  // Read source text
+  // Read source transcript (English VTT or TXT)
   let sourceText = '';
+  if (!sourcePath) {
+    clearInterval(progressTick);
+    const j = jobs.get(jobId);
+    if (j) { j.state = 'error'; j.message = 'English transcript not found — run transcription first'; }
+    currentJobId = null; processNextJob();
+    return;
+  }
+  // Strip VTT cues if source is .vtt (keep only text lines)
+  const isVtt = sourcePath && sourcePath.endsWith('.vtt');
   try {
-    sourceText = fs.readFileSync(inputPath, 'utf-8').trim();
+    sourceText = fs.readFileSync(sourcePath, 'utf-8').trim();
+    if (isVtt) {
+      sourceText = sourceText.split('\n')
+        .filter(line => !(/^\d+$/.test(line.trim())) && !line.includes('-->'))
+        .join('\n').replace(/^WEBVTT.*$/mg, '').replace(/^\s*$/gm, '').trim();
+    }
   } catch (err) {
     clearInterval(progressTick);
     const j = jobs.get(jobId);
