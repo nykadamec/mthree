@@ -242,12 +242,12 @@ function App() {
                       <td>
                         <div className="file-actions">
                           {f.type === 'video' && (
-                            <button className="btn btn-sm btn-mp3" onClick={() => handleExtractMp3(f.name)} title="Extract MP3">🎵 MP3</button>
+                            <button className="btn btn-sm btn-mp3" onClick={() => handleExtractMp3(f.name)} title="Extract audio from video as MP3">MP3</button>
                           )}
                           {(f.type === 'video' || f.type === 'audio') && (
                             <>
-                              <button className="btn btn-sm btn-transcribe" onClick={() => handleTranscribe(f.name)} title="Transcribe to English">📝 EN</button>
-                              <button className="btn btn-sm btn-translate" onClick={() => handleTranslate(f.name)} title="Translate to Czech">🇨🇿 CZ</button>
+                              <button className="btn btn-sm btn-transcribe" onClick={() => handleTranscribe(f.name)} title="Transcribe audio/video to English text">EN</button>
+                              <button className="btn btn-sm btn-translate" onClick={() => handleTranslate(f.name)} title="Translate .en.txt to Czech">CZ</button>
                             </>
                           )}
                           <a href={`/downloads/${f.name}`} download className="btn btn-sm btn-ghost">💾</a>
