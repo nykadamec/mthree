@@ -96,13 +96,26 @@ function groqChat(messages, model = 'llama-4-scout-17b-16e-instruct') {
   });
 }
 
+// VTT timestamp helpers
+function parseVttTime(vttTime) {
+  const [h, m, s] = vttTime.split(':');
+  return parseInt(h) * 3600 + parseInt(m) * 60 + parseFloat(s);
+}
+
+function formatVttTime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = (seconds % 60).toFixed(3);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(6,'0')}`;
+}
+
 function groqTranscribe(filePath) {
   return new Promise((resolve, reject) => {
     if (!GROQ_API_KEY) { reject(new Error('GROQ_API_KEY not set')); return; }
     const fileData = fs.readFileSync(filePath);
     const boundary = '----FormBoundary' + Math.random().toString(36).slice(2);
     const header = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${path.basename(filePath)}"\r\nContent-Type: audio/mpeg\r\n\r\n`;
-    const footer = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-large-v3-turbo\r\n--${boundary}--\r\n`;
+    const footer = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-large-v3-turbo\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\nvtt\r\n--${boundary}--\r\n`;
     const body = Buffer.concat([Buffer.from(header), fileData, Buffer.from(footer)]);
     const options = {
       hostname: 'api.groq.com', path: '/openai/v1/audio/transcriptions',
@@ -112,7 +125,13 @@ function groqTranscribe(filePath) {
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', c => data += c);
-      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { reject(new Error(data)); } });
+      res.on('end', () => {
+        if (data.includes('"error"')) {
+          try { reject(new Error(JSON.parse(data).error.message)); } catch { reject(new Error(data)); }
+        } else {
+          resolve(data); // VTT string directly
+        }
+      });
     });
     req.on('error', reject);
     req.write(body); req.end();
@@ -331,8 +350,8 @@ function startTranscribe(jobId) {
   job.progress = 0;
 
   const inputPath = path.join(DOWNLOAD_DIR, job.sourceFile);
-  const txtFilename = job.sourceFile.replace(/\.[^.]+$/, '') + '.en.txt';
-  const outputPath = path.join(DOWNLOAD_DIR, txtFilename);
+  const vttFilename = job.sourceFile.replace(/\.[^.]+$/, '') + '.en.vtt';
+  const outputPath = path.join(DOWNLOAD_DIR, vttFilename);
   const chunkDir = path.join(DOWNLOAD_DIR, `.chunks_${jobId}`);
   const chunkListFile = path.join(chunkDir, 'list.txt');
 
@@ -367,23 +386,31 @@ function startTranscribe(jobId) {
     return chunks;
   };
 
-  // 3. Transcribe all chunks sequentially
-  const transcribeChunks = async (chunks) => {
-    const allTexts = [];
+  // 3. Transcribe all chunks sequentially and merge VTT with offset timestamps
+  const transcribeChunks = async (chunks, chunkDuration) => {
+    const allVttParts = [];
+    let firstChunk = true;
     const total = chunks.length;
     for (let i = 0; i < chunks.length; i++) {
       if (jobs.get(jobId)?.state !== 'running') break;
       job.progress = Math.round((i / total) * 80);
       job.message = `Transcribing chunk ${i + 1}/${total}...`;
       try {
-        const result = await groqTranscribe(chunks[i]);
-        if (result.error) throw new Error(result.error.message);
-        if (result.text) allTexts.push(result.text);
+        const vtt = await groqTranscribe(chunks[i]);
+        const offset = i * chunkDuration;
+        const adjusted = vtt.replace(/^(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{3})$/gm, (match, start, end) => {
+          return `${formatVttTime(offset + parseVttTime(start))} --> ${formatVttTime(offset + parseVttTime(end))}`;
+        });
+        // Skip WEBVTT header on all but first chunk
+        const lines = adjusted.split('\n');
+        const bodyLines = firstChunk ? lines : lines.filter(l => !l.startsWith('WEBVTT') && l.trim() !== '');
+        allVttParts.push(bodyLines.join('\n'));
+        firstChunk = false;
       } catch (err) {
         jobLog(`[${jobId}] Chunk ${i} error: ${err.message}`);
       }
     }
-    return allTexts.join('\n\n');
+    return allVttParts.join('\n');
   };
 
   // 4. Cleanup
@@ -400,17 +427,17 @@ function startTranscribe(jobId) {
       if (chunks.length === 0) throw new Error('No audio chunks created');
       job.progress = 5;
       job.message = `Transcribing ${chunks.length} chunk(s)...`;
-      const fullText = await transcribeChunks(chunks);
+      const fullVtt = 'WEBVTT\n\n' + await transcribeChunks(chunks, 300);
       cleanup();
       const j2 = jobs.get(jobId);
       if (!j2) { currentJobId = null; return; }
-      if (!fullText.trim()) { j2.state = 'error'; j2.message = 'No speech detected'; }
+      if (!fullVtt.trim()) { j2.state = 'error'; j2.message = 'No speech detected'; }
       else {
-        fs.writeFileSync(outputPath, fullText, 'utf-8');
+        fs.writeFileSync(outputPath, fullVtt, 'utf-8');
         j2.state = 'done'; j2.progress = 100; j2.message = 'Done';
-        j2.downloadUrl = `/downloads/${txtFilename}`;
+        j2.downloadUrl = `/downloads/${vttFilename}`;
         j2.fileSize = getFileSize(outputPath);
-        jobLog(`[${jobId}] Transcribed: ${txtFilename} (${fullText.length} chars)`);
+        jobLog(`[${jobId}] Transcribed: ${vttFilename} (${fullVtt.length} chars)`);
       }
     } catch (err) {
       cleanup();
