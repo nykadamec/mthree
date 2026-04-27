@@ -327,54 +327,101 @@ function startTranscribe(jobId) {
   currentJobId = jobId;
   job.state = 'running';
   job.startedAt = Date.now();
-  job.message = 'Transcribing...';
+  job.message = 'Preparing...';
   job.progress = 0;
 
   const inputPath = path.join(DOWNLOAD_DIR, job.sourceFile);
   const txtFilename = job.sourceFile.replace(/\.[^.]+$/, '') + '.en.txt';
   const outputPath = path.join(DOWNLOAD_DIR, txtFilename);
+  const chunkDir = path.join(DOWNLOAD_DIR, `.chunks_${jobId}`);
+  const chunkListFile = path.join(chunkDir, 'list.txt');
 
-  jobLog(`[${jobId}] Transcribing: ${job.sourceFile} -> ${txtFilename}`);
+  jobLog(`[${jobId}] Transcribing (chunked): ${job.sourceFile}`);
 
-  // Poll file size to simulate progress
-  let lastSize = 0;
-  let transcribed = false;
-
-  const progressTick = setInterval(() => {
-    const j = jobs.get(jobId);
-    if (!j || j.state !== 'running') { clearInterval(progressTick); return; }
-    if (!transcribed) {
-      j.progress = Math.min(j.progress + 5, 90);
-      j.message = `Transcribing... ${j.progress}%`;
-    }
-  }, 1000);
-
-  groqTranscribe(inputPath).then((result) => {
-    transcribed = true;
-    clearInterval(progressTick);
-    const j = jobs.get(jobId);
-    if (!j) { currentJobId = null; return; }
-
-    if (result.error) {
-      j.state = 'error'; j.message = result.error.message || 'Transcription failed';
-      jobLog(`[${jobId}] Transcription error: ${j.message}`);
-    } else {
-      const text = result.text || '';
-      fs.writeFileSync(outputPath, text, 'utf-8');
-      j.state = 'done'; j.progress = 100; j.message = 'Done';
-      j.downloadUrl = `/downloads/${txtFilename}`;
-      j.fileSize = getFileSize(outputPath);
-      jobLog(`[${jobId}] Transcribed: ${txtFilename} (${text.length} chars)`);
-    }
-    delete j.process; currentJobId = null; processNextJob();
-  }).catch((err) => {
-    transcribed = true;
-    clearInterval(progressTick);
-    const j = jobs.get(jobId);
-    if (j) { j.state = 'error'; j.message = err.message || 'Transcription failed'; }
-    currentJobId = null; processNextJob();
-    jobLog(`[${jobId}] Transcription error: ${err.message}`);
+  // 1. Get duration
+  const getDuration = () => new Promise((resolve) => {
+    const p = spawn('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', inputPath]);
+    let out = '';
+    p.stdout.on('data', c => out += c);
+    p.on('close', () => { try { resolve(parseFloat(JSON.parse(out).format?.duration) || 0); } catch { resolve(0); } });
   });
+
+  // 2. Split into ~5min chunks using FFmpeg
+  const splitChunks = async (duration) => {
+    if (!fs.existsSync(chunkDir)) fs.mkdirSync(chunkDir, { recursive: true });
+    const chunkDuration = 300; // 5 minutes per chunk
+    const chunks = [];
+    let start = 0, i = 0;
+    while (start < duration) {
+      const chunkPath = path.join(chunkDir, `chunk_${String(i).padStart(3,'0')}.mp3`);
+      const end = Math.min(start + chunkDuration, duration);
+      await new Promise((res) => {
+        const p = spawn('ffmpeg', ['-y', '-i', inputPath, '-ss', String(start), '-t', String(end - start), '-vn', '-c:a', 'libmp3lame', '-q:a', '2', chunkPath]);
+        p.on('close', res);
+        p.on('error', res);
+      });
+      if (fs.existsSync(chunkPath)) chunks.push(chunkPath);
+      start = end;
+      i++;
+    }
+    return chunks;
+  };
+
+  // 3. Transcribe all chunks sequentially
+  const transcribeChunks = async (chunks) => {
+    const allTexts = [];
+    const total = chunks.length;
+    for (let i = 0; i < chunks.length; i++) {
+      if (jobs.get(jobId)?.state !== 'running') break;
+      job.progress = Math.round((i / total) * 80);
+      job.message = `Transcribing chunk ${i + 1}/${total}...`;
+      try {
+        const result = await groqTranscribe(chunks[i]);
+        if (result.error) throw new Error(result.error.message);
+        if (result.text) allTexts.push(result.text);
+      } catch (err) {
+        jobLog(`[${jobId}] Chunk ${i} error: ${err.message}`);
+      }
+    }
+    return allTexts.join('\n\n');
+  };
+
+  // 4. Cleanup
+  const cleanup = () => {
+    try { if (fs.existsSync(chunkDir)) fs.rmSync(chunkDir, { recursive: true, force: true }); } catch {}
+  };
+
+  (async () => {
+    try {
+      const duration = await getDuration();
+      if (!duration) throw new Error('Could not determine audio duration');
+      job.message = 'Splitting into chunks...';
+      const chunks = await splitChunks(duration);
+      if (chunks.length === 0) throw new Error('No audio chunks created');
+      job.progress = 5;
+      job.message = `Transcribing ${chunks.length} chunk(s)...`;
+      const fullText = await transcribeChunks(chunks);
+      cleanup();
+      const j2 = jobs.get(jobId);
+      if (!j2) { currentJobId = null; return; }
+      if (!fullText.trim()) { j2.state = 'error'; j2.message = 'No speech detected'; }
+      else {
+        fs.writeFileSync(outputPath, fullText, 'utf-8');
+        j2.state = 'done'; j2.progress = 100; j2.message = 'Done';
+        j2.downloadUrl = `/downloads/${txtFilename}`;
+        j2.fileSize = getFileSize(outputPath);
+        jobLog(`[${jobId}] Transcribed: ${txtFilename} (${fullText.length} chars)`);
+      }
+    } catch (err) {
+      cleanup();
+      const j2 = jobs.get(jobId);
+      if (j2) { j2.state = 'error'; j2.message = err.message || 'Transcription failed'; }
+      jobLog(`[${jobId}] Transcription error: ${err.message}`);
+    }
+    delete jobs.get(jobId)?.process;
+    currentJobId = null;
+    processNextJob();
+  })();
 }
 
 // ─── startTranslate(job) ─────────────────────────────────────────────────────
