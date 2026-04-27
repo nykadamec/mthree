@@ -523,6 +523,7 @@ body {
   display: flex;
   gap: 0.4rem;
   flex-wrap: wrap;
+  flex-direction: row-reverse;
 }
 
 /* SMALL BUTTONS */
