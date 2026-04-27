@@ -109,13 +109,25 @@ function formatVttTime(seconds) {
   return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(6,'0')}`;
 }
 
+function verboseJsonToVtt(verboseJson, chunkOffset = 0) {
+  let cueNum = 1;
+  let vtt = '';
+  for (const seg of verboseJson.segments || []) {
+    const start = formatVttTime(seg.start + chunkOffset);
+    const end = formatVttTime(seg.end + chunkOffset);
+    vtt += `${cueNum}\n${start} --> ${end}\n${seg.text.trim()}\n\n`;
+    cueNum++;
+  }
+  return vtt;
+}
+
 function groqTranscribe(filePath) {
   return new Promise((resolve, reject) => {
     if (!GROQ_API_KEY) { reject(new Error('GROQ_API_KEY not set')); return; }
     const fileData = fs.readFileSync(filePath);
     const boundary = '----FormBoundary' + Math.random().toString(36).slice(2);
     const header = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${path.basename(filePath)}"\r\nContent-Type: audio/mpeg\r\n\r\n`;
-    const footer = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-large-v3-turbo\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\nvtt\r\n--${boundary}--\r\n`;
+    const footer = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-large-v3-turbo\r\n--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\nverbose_json\r\n--${boundary}--\r\n`;
     const body = Buffer.concat([Buffer.from(header), fileData, Buffer.from(footer)]);
     const options = {
       hostname: 'api.groq.com', path: '/openai/v1/audio/transcriptions',
@@ -126,11 +138,11 @@ function groqTranscribe(filePath) {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        if (data.includes('"error"')) {
-          try { reject(new Error(JSON.parse(data).error.message)); } catch { reject(new Error(data)); }
-        } else {
-          resolve(data); // VTT string directly
-        }
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) reject(new Error(parsed.error.message));
+          else resolve(parsed); // verbose_json object with segments
+        } catch { reject(new Error(data)); }
       });
     });
     req.on('error', reject);
@@ -389,28 +401,21 @@ function startTranscribe(jobId) {
   // 3. Transcribe all chunks sequentially and merge VTT with offset timestamps
   const transcribeChunks = async (chunks, chunkDuration) => {
     const allVttParts = [];
-    let firstChunk = true;
     const total = chunks.length;
     for (let i = 0; i < chunks.length; i++) {
       if (jobs.get(jobId)?.state !== 'running') break;
       job.progress = Math.round((i / total) * 80);
       job.message = `Transcribing chunk ${i + 1}/${total}...`;
       try {
-        const vtt = await groqTranscribe(chunks[i]);
+        const verboseJson = await groqTranscribe(chunks[i]);
         const offset = i * chunkDuration;
-        const adjusted = vtt.replace(/^(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{3})$/gm, (match, start, end) => {
-          return `${formatVttTime(offset + parseVttTime(start))} --> ${formatVttTime(offset + parseVttTime(end))}`;
-        });
-        // Skip WEBVTT header on all but first chunk
-        const lines = adjusted.split('\n');
-        const bodyLines = firstChunk ? lines : lines.filter(l => !l.startsWith('WEBVTT') && l.trim() !== '');
-        allVttParts.push(bodyLines.join('\n'));
-        firstChunk = false;
+        const vtt = verboseJsonToVtt(verboseJson, offset);
+        allVttParts.push(vtt);
       } catch (err) {
         jobLog(`[${jobId}] Chunk ${i} error: ${err.message}`);
       }
     }
-    return allVttParts.join('\n');
+    return allVttParts.join('');
   };
 
   // 4. Cleanup
