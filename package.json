@@ -5,5 +5,8 @@
     "dev": "bun run --cwd server index.js & bun run --cwd client dev",
     "build": "bun run --cwd client build",
     "start": "bun run --cwd server index.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2"
   }
 }
