@@ -77,7 +77,7 @@ function basename(filepath) {
   return path.basename(filepath);
 }
 
-function groqChat(messages, model = 'llama-4-scout-17b-16e-instruct') {
+function groqChat(messages, model = 'llama-3.1-8b-instant') {
   return new Promise((resolve, reject) => {
     if (!GROQ_API_KEY) { reject(new Error('GROQ_API_KEY not set')); return; }
     const body = JSON.stringify({ model, messages, temperature: 0.3 });
