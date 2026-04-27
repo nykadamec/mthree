@@ -3,6 +3,7 @@ const cors = require('cors');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
 const { randomUUID } = require('crypto');
 
 const app = express();
@@ -10,6 +11,7 @@ const PORT = 7766;
 const DOWNLOAD_DIR = path.join(__dirname, '..', 'download');
 const CLIENT_DIR = path.join(__dirname, '..', 'client');
 const LOG_DIR = path.join(__dirname, '..', 'logs');
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -23,32 +25,23 @@ const jobLog = (msg) => {
 
 jobLog('=== MThree Server Start ===');
 jobLog(`DOWNLOAD_DIR: ${DOWNLOAD_DIR}`);
-jobLog(`LOG_FILE: ${LOG_FILE}`);
-jobLog(`PID: ${process.pid}`);
+jobLog(`GROQ_API_KEY: ${GROQ_API_KEY ? 'set' : 'MISSING'}`);
 
 const jobs = new Map();
 let currentJobId = null;
 
 app.use(cors());
 app.use(express.json());
-
-const distPath = path.join(CLIENT_DIR, 'dist');
-if (fs.existsSync(distPath)) app.use(express.static(distPath));
+app.use(express.static(path.join(CLIENT_DIR, 'dist')));
 app.use('/downloads', express.static(DOWNLOAD_DIR));
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 function checkFFmpeg() {
   return new Promise((resolve) => {
     const p = spawn('ffmpeg', ['-version']);
     p.on('close', (code) => resolve(code === 0));
     p.on('error', () => resolve(false));
   });
-}
-
-function parseTime(timeStr) {
-  const m = timeStr.match(/time=(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
-  if (!m) return null;
-  const [, h, mi, s, ms] = m.map(Number);
-  return h * 3600 + mi * 60 + s + ms / 100;
 }
 
 function formatTime(seconds) {
@@ -69,10 +62,72 @@ function getFileSize(filepath) {
   try { return formatFileSize(fs.statSync(filepath).size); } catch { return null; }
 }
 
-// ─── startFfmpeg(job) ───────────────────────────────────────────────────────
-// Handles FFmpeg spawning, progress tracking, and job state transitions.
-// Uses time-based progress (out_time_ms / duration) from -progress pipe:1.
-// Size watcher only updates job.totalBytes (for resume), NOT progress.
+function getFileMtime(filepath) {
+  try { return fs.statSync(filepath).mtime.toISOString(); } catch { return null; }
+}
+
+function extname(filepath) {
+  const base = path.basename(filepath);
+  const i = base.lastIndexOf('.');
+  return i >= 0 ? base.slice(i + 1).toLowerCase() : '';
+}
+
+function basename(filepath) {
+  return path.basename(filepath);
+}
+
+function groqChat(messages, model = 'llama-4-scout-17b-16e-instruct') {
+  return new Promise((resolve, reject) => {
+    if (!GROQ_API_KEY) { reject(new Error('GROQ_API_KEY not set')); return; }
+    const body = JSON.stringify({ model, messages, temperature: 0.3 });
+    const options = {
+      hostname: 'api.groq.com', path: '/openai/v1/chat/completions',
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { reject(new Error(data)); } });
+    });
+    req.on('error', reject);
+    req.write(body); req.end();
+  });
+}
+
+function groqTranscribe(filePath) {
+  return new Promise((resolve, reject) => {
+    if (!GROQ_API_KEY) { reject(new Error('GROQ_API_KEY not set')); return; }
+    const fileData = fs.readFileSync(filePath);
+    const boundary = '----FormBoundary' + Math.random().toString(36).slice(2);
+    const header = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${path.basename(filePath)}"\r\nContent-Type: audio/mpeg\r\n\r\n`;
+    const footer = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\ndistil-whisper-large-v3-en\r\n--${boundary}--\r\n`;
+    const body = Buffer.concat([Buffer.from(header), fileData, Buffer.from(footer)]);
+    const options = {
+      hostname: 'api.groq.com', path: '/openai/v1/audio/transcriptions',
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length },
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { reject(new Error(data)); } });
+    });
+    req.on('error', reject);
+    req.write(body); req.end();
+  });
+}
+
+// ─── File type detection ─────────────────────────────────────────────────────
+function getFileType(ext) {
+  const videoExts = ['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'];
+  const audioExts = ['mp3', 'wav', 'ogg', 'm4a', 'aac', 'flac', 'opus'];
+  if (videoExts.includes(ext)) return 'video';
+  if (audioExts.includes(ext)) return 'audio';
+  return 'other';
+}
+
+// ─── startFfmpeg(job) ────────────────────────────────────────────────────────
 function startFfmpeg(jobId) {
   const job = jobs.get(jobId);
   if (!job) return;
@@ -82,9 +137,7 @@ function startFfmpeg(jobId) {
   job.startedAt = Date.now();
 
   const outputPath = path.join(DOWNLOAD_DIR, job.filename);
-
   jobLog(`[${jobId}] Starting: ${job.url}`);
-  if (job.outTime) jobLog(`[${jobId}] Resuming from: ${formatTime(job.outTime)}s`);
 
   const args = ['-y', '-i', job.url,
     '-c', 'copy', '-bsf:a', 'aac_adtstoasc', '-movflags', '+faststart',
@@ -97,17 +150,8 @@ function startFfmpeg(jobId) {
   const ffmpeg = spawn('ffmpeg', args);
   job.process = ffmpeg;
 
-  let duration = null;          // total duration in seconds
+  let duration = null;
   let lastPct = -1;
-
-  // Watch file size every 5s — only updates job.totalBytes, NOT progress
-  const sizeWatch = setInterval(() => {
-    try {
-      if (fs.existsSync(outputPath)) {
-        job.totalBytes = fs.statSync(outputPath).size;
-      }
-    } catch {}
-  }, 5000);
 
   ffmpeg.stderr.on('data', (data) => {
     const line = data.toString();
@@ -125,7 +169,6 @@ function startFfmpeg(jobId) {
   ffmpeg.stdout.on('data', (data) => {
     const line = data.toString().trim();
     if (!line || !duration) return;
-
     const timeMs = line.match(/out_time_ms=(\d+)/);
     if (timeMs) {
       const currentTime = parseInt(timeMs[1]) / 1_000_000;
@@ -139,61 +182,278 @@ function startFfmpeg(jobId) {
         }
       }
     }
-
     const sizeMatch = line.match(/total_size=(\d+)/);
     if (sizeMatch) job.totalBytes = parseInt(sizeMatch[1]);
   });
 
   ffmpeg.on('close', (code) => {
-    clearInterval(sizeWatch);
     const j = jobs.get(jobId);
     if (!j) { currentJobId = null; return; }
-
     if (code === 0) {
-      j.state = 'done';
-      j.progress = 100;
-      j.message = 'Done';
+      j.state = 'done'; j.progress = 100; j.message = 'Done';
       j.downloadUrl = `/downloads/${j.filename}`;
       j.fileSize = getFileSize(outputPath);
       jobLog(`[${jobId}] Done: ${j.filename} (${j.fileSize})`);
-      setTimeout(() => { jobs.delete(jobId); jobLog(`[${jobId}] Removed`); }, 100);
+      setTimeout(() => { jobs.delete(jobId); }, 100);
     } else if (j.retries < 2) {
-      j.retries++;
-      j.state = 'queued';
-      j.progress = 0;
-      j.message = `Retry ${j.retries}/3`;
+      j.retries++; j.state = 'queued'; j.progress = 0; j.message = `Retry ${j.retries}/3`;
       jobLog(`[${jobId}] Retry ${j.retries}/3 (code ${code})`);
       setTimeout(() => processNextJob(), 2000);
     } else {
-      j.state = 'error';
-      j.message = 'Failed after 3 attempts';
+      j.state = 'error'; j.message = 'Failed after 3 attempts';
       jobLog(`[${jobId}] Error: code ${code}`);
     }
-
-    delete j.process;
-    currentJobId = null;
-    processNextJob();
+    delete j.process; currentJobId = null; processNextJob();
   });
 
   ffmpeg.on('error', (err) => {
-    clearInterval(sizeWatch);
+    const j = jobs.get(jobId);
+    if (!j) { currentJobId = null; return; }
+    jobLog(`[${jobId}] FFmpeg error: ${err.message}`);
+    if (j.retries < 2) {
+      j.retries++; j.state = 'queued'; j.progress = 0; j.message = `Retry ${j.retries}/3`;
+      setTimeout(() => processNextJob(), 2000);
+    } else {
+      j.state = 'error'; j.message = 'Failed: network error';
+    }
+    delete j.process; currentJobId = null; processNextJob();
+  });
+}
+
+// ─── startExtractMp3(job) ───────────────────────────────────────────────────
+function startExtractMp3(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+
+  currentJobId = jobId;
+  job.state = 'running';
+  job.startedAt = Date.now();
+  job.message = 'Extracting MP3...';
+
+  const inputPath = path.join(DOWNLOAD_DIR, job.sourceFile);
+  const mp3Filename = job.sourceFile.replace(/\.[^.]+$/, '.mp3');
+  const outputPath = path.join(DOWNLOAD_DIR, mp3Filename);
+
+  jobLog(`[${jobId}] Extracting MP3: ${job.sourceFile} -> ${mp3Filename}`);
+
+  // Get duration for progress
+  const probe = spawn('ffprobe', [
+    '-v', 'quiet', '-print_format', 'json',
+    '-show_format', inputPath
+  ]);
+  let duration = 0;
+  let probeDone = false;
+
+  probe.stdout.on('data', (data) => {
+    try {
+      const info = JSON.parse(data.toString());
+      duration = parseFloat(info.format?.duration) || 0;
+    } catch {}
+  });
+  probe.on('close', () => { probeDone = true; });
+
+  const ffmpeg = spawn('ffmpeg', [
+    '-y', '-i', inputPath,
+    '-vn', '-c:a', 'libmp3lame', '-q:a', '2',
+    '-progress', 'pipe:1', outputPath
+  ]);
+  job.process = ffmpeg;
+
+  let lastPct = -1;
+  let ffmpegDone = false;
+
+  const checkDone = setInterval(() => {
+    if (!probeDone || !ffmpegDone) return;
+    clearInterval(checkDone);
+
     const j = jobs.get(jobId);
     if (!j) { currentJobId = null; return; }
 
-    jobLog(`[${jobId}] FFmpeg error: ${err.message}`);
-    if (j.retries < 2) {
-      j.retries++;
-      j.state = 'queued';
-      j.progress = 0;
-      j.message = `Retry ${j.retries}/3`;
-      setTimeout(() => processNextJob(), 2000);
+    if (fs.existsSync(outputPath)) {
+      j.state = 'done'; j.progress = 100; j.message = 'Done';
+      j.downloadUrl = `/downloads/${mp3Filename}`;
+      j.fileSize = getFileSize(outputPath);
+      jobLog(`[${jobId}] MP3 extracted: ${mp3Filename} (${j.fileSize})`);
     } else {
-      j.state = 'error';
-      j.message = 'Failed: network error';
+      j.state = 'error'; j.message = 'Extraction failed';
+      jobLog(`[${jobId}] MP3 extraction failed`);
     }
-    delete j.process;
-    currentJobId = null;
-    processNextJob();
+    delete j.process; currentJobId = null; processNextJob();
+  }, 500);
+
+  ffmpeg.stdout.on('data', (data) => {
+    const line = data.toString().trim();
+    if (!line || !duration) return;
+    const timeMs = line.match(/out_time_ms=(\d+)/);
+    if (timeMs) {
+      const currentTime = parseInt(timeMs[1]) / 1_000_000;
+      if (currentTime > 0 && duration > 0) {
+        job.outTime = currentTime;
+        const pct = Math.min(98, Math.round((currentTime / duration) * 100));
+        if (pct !== lastPct) {
+          lastPct = pct;
+          job.progress = pct;
+          job.message = `Extracting: ${formatTime(currentTime)} / ${formatTime(duration)}`;
+        }
+      }
+    }
+  });
+
+  ffmpeg.on('close', (code) => {
+    ffmpegDone = true;
+    const j = jobs.get(jobId);
+    if (j && code !== 0) {
+      j.state = 'error'; j.message = 'FFmpeg error';
+      delete j.process; currentJobId = null; processNextJob();
+    }
+  });
+
+  ffmpeg.on('error', (err) => {
+    ffmpegDone = true;
+    clearInterval(checkDone);
+    const j = jobs.get(jobId);
+    if (j) { j.state = 'error'; j.message = err.message; delete j.process; }
+    currentJobId = null; processNextJob();
+    jobLog(`[${jobId}] FFmpeg error: ${err.message}`);
+  });
+}
+
+// ─── startTranscribe(job) ───────────────────────────────────────────────────
+function startTranscribe(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+
+  currentJobId = jobId;
+  job.state = 'running';
+  job.startedAt = Date.now();
+  job.message = 'Transcribing...';
+  job.progress = 0;
+
+  const inputPath = path.join(DOWNLOAD_DIR, job.sourceFile);
+  const txtFilename = job.sourceFile.replace(/\.[^.]+$/, '') + '.en.txt';
+  const outputPath = path.join(DOWNLOAD_DIR, txtFilename);
+
+  jobLog(`[${jobId}] Transcribing: ${job.sourceFile} -> ${txtFilename}`);
+
+  // Poll file size to simulate progress
+  let lastSize = 0;
+  let transcribed = false;
+
+  const progressTick = setInterval(() => {
+    const j = jobs.get(jobId);
+    if (!j || j.state !== 'running') { clearInterval(progressTick); return; }
+    if (!transcribed) {
+      j.progress = Math.min(j.progress + 5, 90);
+      j.message = `Transcribing... ${j.progress}%`;
+    }
+  }, 1000);
+
+  groqTranscribe(inputPath).then((result) => {
+    transcribed = true;
+    clearInterval(progressTick);
+    const j = jobs.get(jobId);
+    if (!j) { currentJobId = null; return; }
+
+    if (result.error) {
+      j.state = 'error'; j.message = result.error.message || 'Transcription failed';
+      jobLog(`[${jobId}] Transcription error: ${j.message}`);
+    } else {
+      const text = result.text || '';
+      fs.writeFileSync(outputPath, text, 'utf-8');
+      j.state = 'done'; j.progress = 100; j.message = 'Done';
+      j.downloadUrl = `/downloads/${txtFilename}`;
+      j.fileSize = getFileSize(outputPath);
+      jobLog(`[${jobId}] Transcribed: ${txtFilename} (${text.length} chars)`);
+    }
+    delete j.process; currentJobId = null; processNextJob();
+  }).catch((err) => {
+    transcribed = true;
+    clearInterval(progressTick);
+    const j = jobs.get(jobId);
+    if (j) { j.state = 'error'; j.message = err.message || 'Transcription failed'; }
+    currentJobId = null; processNextJob();
+    jobLog(`[${jobId}] Transcription error: ${err.message}`);
+  });
+}
+
+// ─── startTranslate(job) ─────────────────────────────────────────────────────
+function startTranslate(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+
+  currentJobId = jobId;
+  job.state = 'running';
+  job.startedAt = Date.now();
+  job.message = 'Translating...';
+  job.progress = 0;
+
+  const inputPath = path.join(DOWNLOAD_DIR, job.sourceFile);
+  const txtFilename = job.sourceFile.replace(/\.[^.]+$/, '') + '.cz.txt';
+  const outputPath = path.join(DOWNLOAD_DIR, txtFilename);
+
+  jobLog(`[${jobId}] Translating: ${job.sourceFile} -> ${txtFilename}`);
+
+  let translated = false;
+  const progressTick = setInterval(() => {
+    const j = jobs.get(jobId);
+    if (!j || j.state !== 'running') { clearInterval(progressTick); return; }
+    if (!translated) {
+      j.progress = Math.min(j.progress + 5, 90);
+      j.message = `Translating... ${j.progress}%`;
+    }
+  }, 500);
+
+  // Read source text
+  let sourceText = '';
+  try {
+    sourceText = fs.readFileSync(inputPath, 'utf-8').trim();
+  } catch (err) {
+    clearInterval(progressTick);
+    const j = jobs.get(jobId);
+    if (j) { j.state = 'error'; j.message = 'Source file not found'; }
+    currentJobId = null; processNextJob();
+    return;
+  }
+
+  if (!sourceText) {
+    clearInterval(progressTick);
+    const j = jobs.get(jobId);
+    if (j) { j.state = 'error'; j.message = 'Source file is empty'; }
+    currentJobId = null; processNextJob();
+    return;
+  }
+
+  groqChat([
+    {
+      role: 'system',
+      content: 'You are an expert translator. Translate the following English text to Czech. Preserve the original meaning exactly, including any names, technical terms, and punctuation. Only output the translation, nothing else. If the text is empty or meaningless, output "No content".',
+    },
+    { role: 'user', content: sourceText },
+  ]).then((result) => {
+    translated = true;
+    clearInterval(progressTick);
+    const j = jobs.get(jobId);
+    if (!j) { currentJobId = null; return; }
+
+    if (result.error) {
+      j.state = 'error'; j.message = result.error.message || 'Translation failed';
+      jobLog(`[${jobId}] Translation error: ${j.message}`);
+    } else {
+      const translation = result.choices[0].message.content.trim();
+      fs.writeFileSync(outputPath, translation, 'utf-8');
+      j.state = 'done'; j.progress = 100; j.message = 'Done';
+      j.downloadUrl = `/downloads/${txtFilename}`;
+      j.fileSize = getFileSize(outputPath);
+      jobLog(`[${jobId}] Translated: ${txtFilename} (${translation.length} chars)`);
+    }
+    delete j.process; currentJobId = null; processNextJob();
+  }).catch((err) => {
+    translated = true;
+    clearInterval(progressTick);
+    const j = jobs.get(jobId);
+    if (j) { j.state = 'error'; j.message = err.message || 'Translation failed'; }
+    currentJobId = null; processNextJob();
+    jobLog(`[${jobId}] Translation error: ${err.message}`);
   });
 }
 
@@ -201,11 +461,42 @@ function startFfmpeg(jobId) {
 function processNextJob() {
   if (currentJobId) return;
   for (const [id, job] of jobs) {
-    if (job.state === 'queued') { startFfmpeg(id); return; }
+    if (job.state === 'queued') {
+      const t = job.type;
+      if (t === 'download') startFfmpeg(id);
+      else if (t === 'extract-mp3') startExtractMp3(id);
+      else if (t === 'transcribe') startTranscribe(id);
+      else if (t === 'translate') startTranslate(id);
+      return;
+    }
   }
 }
 
-// ─── POST /api/download ──────────────────────────────────────────────────────
+// ─── Routes ──────────────────────────────────────────────────────────────────
+
+// GET /api/files — list files in download folder
+app.get('/api/files', (req, res) => {
+  if (!fs.existsSync(DOWNLOAD_DIR)) return res.json({ files: [] });
+  const files = fs.readdirSync(DOWNLOAD_DIR)
+    .filter(f => !f.startsWith('.'))
+    .map(name => {
+      const ext = extname(name);
+      const filePath = path.join(DOWNLOAD_DIR, name);
+      const stats = fs.statSync(filePath);
+      return {
+        name,
+        size: formatFileSize(stats.size),
+        sizeBytes: stats.size,
+        mtime: stats.mtime.toISOString(),
+        type: getFileType(ext),
+        ext,
+      };
+    })
+    .sort((a, b) => new Date(b.mtime) - new Date(a.mtime));
+  res.json({ files });
+});
+
+// POST /api/download
 app.post('/api/download', async (req, res) => {
   const { url, filename } = req.body;
   if (!url || !url.includes('.m3u8')) return res.status(400).json({ error: 'Invalid .m3u8 URL' });
@@ -217,7 +508,7 @@ app.post('/api/download', async (req, res) => {
     : `download_${jobId.slice(0, 8)}.mp4`;
 
   const job = {
-    id: jobId, url, filename: finalFilename,
+    id: jobId, type: 'download', url, filename: finalFilename,
     state: 'queued', progress: 0, message: 'Queued', retries: 0,
     createdAt: Date.now(), downloadUrl: null, fileSize: null,
     outTime: null, totalBytes: null, durationEstimate: null,
@@ -228,137 +519,106 @@ app.post('/api/download', async (req, res) => {
   processNextJob();
 });
 
-// ─── POST /api/pause/:jobId ─────────────────────────────────────────────────
+// POST /api/extract-mp3
+app.post('/api/extract-mp3', async (req, res) => {
+  const { filename } = req.body;
+  if (!filename) return res.status(400).json({ error: 'Missing filename' });
+  const inputPath = path.join(DOWNLOAD_DIR, filename);
+  if (!fs.existsSync(inputPath)) return res.status(404).json({ error: 'File not found' });
+  const ext = extname(filename);
+  const videoExts = ['mp4', 'mkv', 'avi', 'mov', 'webm', 'flv', 'wmv'];
+  if (!videoExts.includes(ext)) return res.status(400).json({ error: 'Not a video file' });
+
+  const jobId = randomUUID();
+  const job = {
+    id: jobId, type: 'extract-mp3', sourceFile: filename,
+    filename: filename.replace(/\.[^.]+$/, '.mp3'),
+    state: 'queued', progress: 0, message: 'Queued', retries: 0,
+    createdAt: Date.now(), downloadUrl: null, fileSize: null,
+  };
+  jobs.set(jobId, job);
+  jobLog(`[${jobId}] MP3 extraction queued: ${filename}`);
+  res.json({ jobId });
+  processNextJob();
+});
+
+// POST /api/transcribe
+app.post('/api/transcribe', async (req, res) => {
+  const { filename } = req.body;
+  if (!filename) return res.status(400).json({ error: 'Missing filename' });
+  if (!GROQ_API_KEY) return res.status(500).json({ error: 'GROQ_API_KEY not set' });
+  const inputPath = path.join(DOWNLOAD_DIR, filename);
+  if (!fs.existsSync(inputPath)) return res.status(404).json({ error: 'File not found' });
+  const ext = extname(filename);
+  const audioExts = ['mp3', 'wav', 'ogg', 'm4a', 'aac', 'flac', 'opus', 'mp4', 'mkv', 'avi', 'mov'];
+  if (!audioExts.includes(ext)) return res.status(400).json({ error: 'Unsupported audio/video file' });
+
+  const jobId = randomUUID();
+  const job = {
+    id: jobId, type: 'transcribe', sourceFile: filename,
+    filename: filename.replace(/\.[^.]+$/, '') + '.en.txt',
+    state: 'queued', progress: 0, message: 'Queued', retries: 0,
+    createdAt: Date.now(), downloadUrl: null, fileSize: null,
+  };
+  jobs.set(jobId, job);
+  jobLog(`[${jobId}] Transcription queued: ${filename}`);
+  res.json({ jobId });
+  processNextJob();
+});
+
+// POST /api/translate
+app.post('/api/translate', async (req, res) => {
+  const { filename } = req.body;
+  if (!filename) return res.status(400).json({ error: 'Missing filename' });
+  if (!GROQ_API_KEY) return res.status(500).json({ error: 'GROQ_API_KEY not set' });
+  const inputPath = path.join(DOWNLOAD_DIR, filename);
+  if (!fs.existsSync(inputPath)) return res.status(404).json({ error: 'File not found' });
+
+  const jobId = randomUUID();
+  const job = {
+    id: jobId, type: 'translate', sourceFile: filename,
+    filename: filename.replace(/\.[^.]+$/, '') + '.cz.txt',
+    state: 'queued', progress: 0, message: 'Queued', retries: 0,
+    createdAt: Date.now(), downloadUrl: null, fileSize: null,
+  };
+  jobs.set(jobId, job);
+  jobLog(`[${jobId}] Translation queued: ${filename}`);
+  res.json({ jobId });
+  processNextJob();
+});
+
+// POST /api/pause/:jobId
 app.post('/api/pause/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Not found' });
   if (job.state !== 'running') return res.status(400).json({ error: 'Not running' });
-
+  if (job.type !== 'download') return res.status(400).json({ error: 'Only downloads can be paused' });
   job.state = 'paused';
   if (job.process) { job.process.kill('SIGTERM'); delete job.process; }
   jobLog(`[${job.id}] Paused at ${formatTime(job.outTime || 0)}s`);
   res.json({ ok: true });
 });
 
-// ─── POST /api/resume/:jobId ─────────────────────────────────────────────────
+// POST /api/resume/:jobId
 app.post('/api/resume/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Not found' });
   if (job.state !== 'paused') return res.status(400).json({ error: 'Not paused' });
+  if (job.type !== 'download') return res.status(400).json({ error: 'Only downloads can be resumed' });
 
-  job.state = 'resuming';
+  job.state = 'queued';
   jobLog(`[${job.id}] Resuming from ${formatTime(job.outTime || 0)}s`);
-
-  // If outTime is 0, just restart as a fresh job
-  if (!job.outTime || job.outTime === 0) {
-    job.outTime = null;
-    job.totalBytes = null;
-    job.durationEstimate = null;
-    job.state = 'queued';
-    processNextJob();
-    return res.json({ ok: true });
-  }
-
-  const outputPath = path.join(DOWNLOAD_DIR, job.filename);
-
-  // Try to resume with -ss. If file doesn't exist, start from 0.
-  if (!fs.existsSync(outputPath)) {
-    jobLog(`[${job.id}] Output file gone, starting from 0`);
-    job.outTime = null;
-    job.totalBytes = null;
-    job.state = 'queued';
-    processNextJob();
-    return res.json({ ok: true });
-  }
-
-  const args = ['-y', '-ss', String(job.outTime), '-i', job.url,
-    '-c', 'copy', '-bsf:a', 'aac_adtstoasc', '-movflags', '+faststart',
-    '-progress', 'pipe:1', outputPath];
-
-  const ffmpeg = spawn('ffmpeg', args);
-  job.process = ffmpeg;
-
-  let duration = job.durationEstimate || null;
-  let lastPct = -1;
-
-  ffmpeg.stderr.on('data', (data) => {
-    const line = data.toString();
-    if (!duration) {
-      const m = line.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2})\.(\d{2})/);
-      if (m) {
-        const [, h, mi, s, ms] = m.map(Number);
-        duration = h * 3600 + mi * 60 + s + ms / 100;
-        job.durationEstimate = duration;
-      }
-    }
-  });
-
-  ffmpeg.stdout.on('data', (data) => {
-    const line = data.toString().trim();
-    if (!line || !duration) return;
-    const timeMs = line.match(/out_time_ms=(\d+)/);
-    if (timeMs) {
-      const currentTime = parseInt(timeMs[1]) / 1_000_000;
-      if (currentTime > 0) {
-        job.outTime = currentTime;
-        const pct = Math.min(98, Math.round((currentTime / duration) * 100));
-        if (pct !== lastPct) {
-          lastPct = pct;
-          job.progress = pct;
-          job.message = `${formatTime(currentTime)} / ${formatTime(duration)}`;
-        }
-      }
-    }
-    const sizeMatch = line.match(/total_size=(\d+)/);
-    if (sizeMatch) job.totalBytes = parseInt(sizeMatch[1]);
-  });
-
-  ffmpeg.on('close', (code) => {
-    const j = jobs.get(job.id);
-    if (!j) { currentJobId = null; return; }
-
-    if (code === 0) {
-      j.state = 'done';
-      j.progress = 100;
-      j.message = 'Done';
-      j.downloadUrl = `/downloads/${j.filename}`;
-      j.fileSize = getFileSize(outputPath);
-      jobLog(`[${job.id}] Done: ${j.filename} (${j.fileSize})`);
-      setTimeout(() => { jobs.delete(job.id); }, 100);
-    } else {
-      // Resume failed — probably segment expired, offer restart from 0
-      j.state = 'paused';
-      j.message = 'Segment expired';
-      jobLog(`[${job.id}] Resume failed (code ${code})`);
-      delete j.process;
-      currentJobId = null;
-      res.json({ ok: false, reason: 'segment_expired' });
-      return;
-    }
-    delete j.process;
-    currentJobId = null;
-    processNextJob();
-    res.json({ ok: true });
-  });
-
-  ffmpeg.on('error', (err) => {
-    const j = jobs.get(job.id);
-    if (j) { j.state = 'paused'; j.message = 'Resume error'; delete j.process; }
-    currentJobId = null;
-    jobLog(`[${job.id}] Resume error: ${err.message}`);
-    res.json({ ok: false, reason: 'error', message: err.message });
-  });
-
+  processNextJob();
   res.json({ ok: true });
 });
 
-// ─── GET /api/queue ───────────────────────────────────────────────────────────
+// GET /api/queue
 app.get('/api/queue', (req, res) => {
   const all = Array.from(jobs.values()).map(({ process, ...j }) => j);
   res.json({ jobs: all });
 });
 
-// ─── DELETE /api/job/:jobId ──────────────────────────────────────────────────
+// DELETE /api/job/:jobId
 app.delete('/api/job/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (job) {
@@ -366,8 +626,6 @@ app.delete('/api/job/:jobId', (req, res) => {
       job.process.kill('SIGTERM');
       delete job.process;
     }
-    job.state = 'cancelled';
-    job.message = 'Cancelled';
     jobLog(`[${job.id}] Cancelled`);
     jobs.delete(req.params.jobId);
   }
@@ -375,10 +633,10 @@ app.delete('/api/job/:jobId', (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── SPA fallback ─────────────────────────────────────────────────────────────
+// SPA fallback
 app.get('*', (req, res, next) => {
   if (req.path.startsWith('/api') || req.path.startsWith('/downloads')) return next();
-  const idx = path.join(distPath, 'index.html');
+  const idx = path.join(CLIENT_DIR, 'dist', 'index.html');
   if (fs.existsSync(idx)) res.sendFile(idx);
   else res.status(200).send('<html><body><h1>MThree Running</h1></body></html>');
 });

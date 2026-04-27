@@ -375,6 +375,152 @@ body {
   align-self: center;
 }
 
+/* HEADER ACTIONS */
+.header-actions {
+  display: flex;
+  gap: 0.25rem;
+  align-items: center;
+}
+
+/* TYPE BADGE */
+.type-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  margin-right: 0.25rem;
+}
+
+/* MODAL */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 1rem;
+}
+
+.modal {
+  background: #1e1e1e;
+  border-radius: 16px;
+  width: 100%;
+  max-width: 700px;
+  max-height: 80vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #333;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1.25rem 1.5rem;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+.modal-header h2 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #e0e0e0;
+}
+
+.modal > *:not(:last-child) {
+  overflow: auto;
+}
+
+/* FILES TABLE */
+.files-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.files-table th {
+  text-align: left;
+  padding: 0.75rem 1.5rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #555;
+  border-bottom: 1px solid #2a2a2a;
+  position: sticky;
+  top: 0;
+  background: #1e1e1e;
+}
+
+.files-table td {
+  padding: 0.85rem 1.5rem;
+  border-bottom: 1px solid #222;
+  vertical-align: middle;
+}
+
+.files-table tr:last-child td {
+  border-bottom: none;
+}
+
+.files-table tr:hover td {
+  background: #252525;
+}
+
+.file-name {
+  color: #e0e0e0;
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.file-meta {
+  font-size: 0.7rem;
+  color: #555;
+  margin-top: 0.2rem;
+  text-transform: uppercase;
+}
+
+.file-size {
+  color: #888;
+  white-space: nowrap;
+  font-size: 0.8rem;
+}
+
+.file-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+/* SMALL BUTTONS */
+.btn-sm {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.75rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: opacity 0.2s;
+  border: none;
+}
+
+.btn-sm:hover { opacity: 0.8; }
+
+.btn-sm.btn-mp3 {
+  background: #00bcd420;
+  color: #00bcd4;
+  border: 1px solid #00bcd4;
+}
+
+.btn-sm.btn-transcribe {
+  background: #9c27b020;
+  color: #9c27b0;
+  border: 1px solid #9c27b0;
+}
+
+.btn-sm.btn-translate {
+  background: #ff980020;
+  color: #ff9800;
+  border: 1px solid #ff9800;
+}
+
 /* ERROR */
 .error-msg {
   color: #ff4444;
