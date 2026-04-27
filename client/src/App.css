@@ -433,19 +433,31 @@ body {
 
 /* INFO BOX */
 .info-box {
+  padding: 0.75rem 1.5rem;
+  border-bottom: 1px solid #2a2a2a;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  color: #666;
+}
+
+.info-row {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.6rem 1.5rem;
-  background: #1a1a2e;
-  border-bottom: 1px solid #2a2a2a;
-  font-size: 0.75rem;
-  color: #888;
+  gap: 0.6rem;
+}
+
+.info-row b {
+  font-weight: 700;
+  width: 2.2rem;
+  color: #aaa;
 }
 
 .info-icon {
-  font-size: 0.85rem;
-  flex-shrink: 0;
+  font-size: 0.75rem;
+  margin-bottom: 0.1rem;
+  color: #555;
 }
 
 /* FILES TABLE */
@@ -509,33 +521,33 @@ body {
 
 /* SMALL BUTTONS */
 .btn-sm {
-  padding: 0.3rem 0.6rem;
-  font-size: 0.75rem;
-  border-radius: 6px;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.7rem;
+  border-radius: 5px;
   cursor: pointer;
-  font-weight: 600;
+  font-weight: 500;
   transition: opacity 0.2s;
-  border: none;
+  border: 1px solid;
 }
 
-.btn-sm:hover { opacity: 0.8; }
+.btn-sm:hover { opacity: 0.7; }
 
 .btn-sm.btn-mp3 {
-  background: #00bcd420;
-  color: #00bcd4;
-  border: 1px solid #00bcd4;
+  color: #5ec8d8;
+  border-color: #3a3a3a;
+  background: transparent;
 }
 
 .btn-sm.btn-transcribe {
-  background: #9c27b020;
-  color: #9c27b0;
-  border: 1px solid #9c27b0;
+  color: #b87fd4;
+  border-color: #3a3a3a;
+  background: transparent;
 }
 
 .btn-sm.btn-translate {
-  background: #ff980020;
-  color: #ff9800;
-  border: 1px solid #ff9800;
+  color: #d4a05c;
+  border-color: #3a3a3a;
+  background: transparent;
 }
 
 /* ERROR */

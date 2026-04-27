@@ -207,8 +207,18 @@ function App() {
               <button className="btn btn-ghost" onClick={() => setShowFiles(false)}>✕</button>
             </div>
             <div className="info-box">
-              <span className="info-icon">ℹ️</span>
-              <span><b>MP3</b> — extract audio from video &nbsp;·&nbsp; <b>EN</b> — transcribe to English (Grok Whisper) &nbsp;·&nbsp; <b>CZ</b> — translate to Czech (needs .en.txt)</span>
+              <div className="info-row">
+                <span className="info-icon">ℹ️</span>
+                <b>MP3</b><span>extract audio from video</span>
+              </div>
+              <div className="info-row">
+                <span className="info-icon">ℹ️</span>
+                <b>EN</b><span>transcribe to English (Grok Whisper)</span>
+              </div>
+              <div className="info-row">
+                <span className="info-icon">ℹ️</span>
+                <b>CZ</b><span>translate to Czech (needs .en.txt)</span>
+              </div>
             </div>
             {files.length === 0 ? (
               <p style={{color:'#888', textAlign:'center', padding:'2rem'}}>No files yet</p>
