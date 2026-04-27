@@ -217,7 +217,7 @@ function App() {
               </div>
               <div className="info-row">
                 <span className="info-icon">ℹ️</span>
-                <b>CZ</b><span>translate to Czech (needs .en.txt)</span>
+                <b>CZ</b><span>translate to Czech (unavailable)</span>
               </div>
             </div>
             {files.length === 0 ? (
@@ -247,7 +247,7 @@ function App() {
                           {(f.type === 'video' || f.type === 'audio') && (
                             <>
                               <button className="btn btn-sm btn-transcribe" onClick={() => handleTranscribe(f.name)} title="Transcribe audio/video to English text">EN</button>
-                              <button className="btn btn-sm btn-translate" onClick={() => handleTranslate(f.name)} title="Translate .en.txt to Czech">CZ</button>
+                              <button className="btn btn-sm btn-translate" disabled onClick={() => alert('Translation is temporarily unavailable')} title="Translate to Czech (unavailable)">CZ</button>
                             </>
                           )}
                           <a href={`/downloads/${f.name}`} download className="btn btn-sm btn-ghost">💾</a>

@@ -547,6 +547,7 @@ body {
 .btn-sm.btn-mp3:hover { color: #5ec8d8; }
 .btn-sm.btn-transcribe:hover { color: #b87fd4; }
 .btn-sm.btn-translate:hover { color: #d4a05c; }
+.btn-sm.btn-translate:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ERROR */
 .error-msg {
