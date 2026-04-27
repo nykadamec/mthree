@@ -13,7 +13,7 @@ const { loadavg } = require('os');
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const GROQ_API_KEY = process.env.GROQ_API_KEY || 'your-groq-api-key-here';
-const MODEL_STT = 'distil-whisper-large-v3-en';  // English-only STT
+const MODEL_STT = 'whisper-large-v3-turbo';  // Multilingual STT
 const MODEL_LLM = 'llama-4-scout-17b-16e-instruct';  // Groq's LLM for translation
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

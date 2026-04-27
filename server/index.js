@@ -102,7 +102,7 @@ function groqTranscribe(filePath) {
     const fileData = fs.readFileSync(filePath);
     const boundary = '----FormBoundary' + Math.random().toString(36).slice(2);
     const header = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${path.basename(filePath)}"\r\nContent-Type: audio/mpeg\r\n\r\n`;
-    const footer = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\ndistil-whisper-large-v3-en\r\n--${boundary}--\r\n`;
+    const footer = `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-large-v3-turbo\r\n--${boundary}--\r\n`;
     const body = Buffer.concat([Buffer.from(header), fileData, Buffer.from(footer)]);
     const options = {
       hostname: 'api.groq.com', path: '/openai/v1/audio/transcriptions',
