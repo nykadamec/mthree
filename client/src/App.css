@@ -431,6 +431,23 @@ body {
   overflow: auto;
 }
 
+/* INFO BOX */
+.info-box {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.6rem 1.5rem;
+  background: #1a1a2e;
+  border-bottom: 1px solid #2a2a2a;
+  font-size: 0.75rem;
+  color: #888;
+}
+
+.info-icon {
+  font-size: 0.85rem;
+  flex-shrink: 0;
+}
+
 /* FILES TABLE */
 .files-table {
   width: 100%;
