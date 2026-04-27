@@ -9,17 +9,29 @@ const app = express();
 const PORT = 7766;
 const DOWNLOAD_DIR = path.join(__dirname, '..', 'download');
 const CLIENT_DIR = path.join(__dirname, '..', 'client');
-
-console.error('=== MThree Server Start ===');
-console.error('__dirname:', __dirname);
-console.error('DOWNLOAD_DIR:', DOWNLOAD_DIR);
-console.error('CLIENT_DIR:', CLIENT_DIR);
+const LOG_DIR = path.join(__dirname, '..', 'logs');
 
 // Ensure directories exist
 if (!fs.existsSync(DOWNLOAD_DIR)) {
   fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
-  console.error('Created download dir');
 }
+if (!fs.existsSync(LOG_DIR)) {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+}
+
+// Persistent job log — logs/jobs_YYYY-MM-DD.log
+const LOG_FILE = path.join(LOG_DIR, `jobs_${new Date().toISOString().slice(0,10)}.log`);
+const jobLog = (msg) => {
+  const ts = new Date().toISOString();
+  const line = `[${ts}] ${msg}\n`;
+  fs.appendFileSync(LOG_FILE, line);
+  console.error(`[JOB] ${msg}`);
+};
+
+jobLog('=== MThree Server Start ===');
+jobLog(`DOWNLOAD_DIR: ${DOWNLOAD_DIR}`);
+jobLog(`LOG_FILE: ${LOG_FILE}`);
+jobLog(`PID: ${process.pid}`);
 
 // In-memory job store
 const jobs = new Map();
@@ -35,7 +47,6 @@ if (fs.existsSync(distPath)) {
 }
 
 // Serve API and downloads
-app.use('/api', express.json());
 app.use('/downloads', express.static(DOWNLOAD_DIR));
 
 // FFmpeg availability check
@@ -99,13 +110,13 @@ function processNextJob() {
   const { url, filename } = job;
   const outputPath = path.join(DOWNLOAD_DIR, filename);
 
-  console.error(`[${currentJobId}] Starting: ${url}`);
-  console.error(`[${currentJobId}] Output: ${outputPath}`);
+  jobLog(`[${currentJobId}] Starting: ${url}`);
+  jobLog(`[${currentJobId}] Output: ${outputPath}`);
 
   // Delete existing file if present (FFmpeg won't overwrite)
   if (fs.existsSync(outputPath)) {
     fs.unlinkSync(outputPath);
-    console.error(`[${currentJobId}] Deleted existing file`);
+    jobLog(`[${currentJobId}] Deleted existing file`);
   }
 
   const ffmpeg = spawn('ffmpeg', [
@@ -137,7 +148,7 @@ function processNextJob() {
           if (durationEstimate && lastFileSize > 0) {
             const progress = Math.min(98, Math.round((lastFileSize / totalBytes) * 100));
             if (progress !== lastLoggedProgress) {
-              console.error(`[${currentJobId}] Size: ${lastFileSize} / ${totalBytes} = ${progress}%`);
+              jobLog(`[${currentJobId}] Progress: ${lastFileSize} / ${totalBytes} bytes = ${progress}%`);
               lastLoggedProgress = progress;
               job.progress = progress;
               job.message = `${progress}%`;
@@ -157,7 +168,7 @@ function processNextJob() {
         const [, h, m, s, ms] = durMatch.map(Number);
         durationEstimate = h * 3600 + m * 60 + s + ms / 100;
         job.estimatedTotal = durationEstimate;
-        console.error(`[${currentJobId}] Duration from header: ${durationEstimate.toFixed(1)}s`);
+        jobLog(`[${currentJobId}] Duration from header: ${durationEstimate.toFixed(1)}s`);
       }
     }
   });
@@ -172,7 +183,7 @@ function processNextJob() {
       if (currentTime > 0) {
         const progress = Math.min(98, Math.round((currentTime / durationEstimate) * 100));
         if (progress !== lastLoggedProgress) {
-          console.error(`[${currentJobId}] Progress: ${currentTime.toFixed(1)}s / ${durationEstimate.toFixed(1)}s = ${progress}%`);
+          jobLog(`[${currentJobId}] Progress: ${formatTime(currentTime)} / ${formatTime(durationEstimate)} = ${progress}%`);
           lastLoggedProgress = progress;
           job.progress = progress;
           job.message = `${formatTime(currentTime)} / ${formatTime(durationEstimate)}`;
@@ -197,23 +208,23 @@ function processNextJob() {
       job.message = 'Done';
       job.downloadUrl = `/downloads/${filename}`;
       job.fileSize = getFileSize(outputPath);
-      console.error(`[${currentJobId}] Done: ${filename} (${job.fileSize})`);
+      jobLog(`[${currentJobId}] Done: ${filename} (${job.fileSize})`);
       // Remove from jobs map immediately
       setTimeout(() => {
         jobs.delete(currentJobId);
-        console.error(`[${currentJobId}] Removed from queue`);
+        jobLog(`[${currentJobId}] Removed from queue`);
       }, 100);
     } else if (job.retries < 2) {
       job.retries++;
       job.state = 'queued';
       job.progress = 0;
       job.message = `Retry ${job.retries}/3`;
-      console.error(`[${currentJobId}] Retry ${job.retries}/3`);
+      jobLog(`[${currentJobId}] Retry ${job.retries}/3 (exit code ${code})`);
       setTimeout(() => processNextJob(), 2000);
     } else {
       job.state = 'error';
       job.message = 'Failed after 3 attempts';
-      console.error(`[${currentJobId}] Error: exited with code ${code}`);
+      jobLog(`[${currentJobId}] Error: exited with code ${code}`);
     }
 
     currentJobId = null;
@@ -225,14 +236,14 @@ function processNextJob() {
     const job = jobs.get(currentJobId);
     if (!job) { currentJobId = null; return; }
 
-    console.error(`[${currentJobId}] FFmpeg error: ${err.message}`);
+    jobLog(`[${currentJobId}] FFmpeg error: ${err.message}`);
 
     if (job.retries < 2) {
       job.retries++;
       job.state = 'queued';
       job.progress = 0;
       job.message = `Retry ${job.retries}/3`;
-      console.error(`[${currentJobId}] Network error, retry ${job.retries}/3`);
+      jobLog(`[${currentJobId}] Network error, retry ${job.retries}/3`);
       setTimeout(() => processNextJob(), 2000);
     } else {
       job.state = 'error';
@@ -275,7 +286,7 @@ app.post('/api/download', async (req, res) => {
   };
 
   jobs.set(jobId, job);
-  console.error(`[${jobId}] Queued: ${url} -> ${finalFilename}`);
+  jobLog(`[${jobId}] Queued: ${url} -> ${finalFilename}`);
 
   res.json({ jobId, filename: finalFilename });
   processNextJob();
@@ -306,7 +317,7 @@ app.delete('/api/job/:jobId', (req, res) => {
     job.process.kill('SIGTERM');
     job.state = 'cancelled';
     job.message = 'Cancelled';
-    console.error(`[${job.id}] Cancelled`);
+    jobLog(`[${job.id}] Cancelled`);
   }
 
   jobs.delete(req.params.jobId);
@@ -330,7 +341,7 @@ app.get('*', (req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.error(`MThree server running on http://localhost:${PORT}`);
-  console.error(`Download directory: ${DOWNLOAD_DIR}`);
-  console.error(`PID: ${process.pid}`);
+  jobLog(`MThree server running on http://localhost:${PORT}`);
+  jobLog(`Download directory: ${DOWNLOAD_DIR}`);
+  jobLog(`Log file: ${LOG_FILE}`);
 });
